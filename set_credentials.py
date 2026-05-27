@@ -7,11 +7,11 @@ import keyring
 SERVICE_NAME = "mcp-sqlserver-pccom"
 
 FIELDS = [
-    ("host",          "SQL Server host (e.g. SQLEXPRESS\\192.168.1.100)", False),
+    ("host",          "SQL Server host (e.g. 192.168.1.100\\SQLEXPRESS)", False),
     ("user",          "SQL Server user",                                  False),
     ("password",      "SQL Server password",                              False),
-    ("database_pccom","Database name (e.g. pccom)",                       False),
-    ("database_dat",  "Database name (e.g. dat1)",                        False),
+    ("database_pccom","Master database name (e.g. pccom)",                False),
+    ("database_dat",  "Tenant database name (e.g. dat1)",                 False),
 ]
 
 

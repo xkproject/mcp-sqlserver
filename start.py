@@ -10,6 +10,11 @@ import keyring
 SERVICE_NAME = "mcp-sqlserver-pccom"
 SCRIPT_DIR = Path(__file__).parent
 
+INSTALL_URLS = {
+    "node": "https://nodejs.org/  (or via fnm: https://github.com/Schniz/fnm)",
+    "pnpm": "https://pnpm.io/installation",
+}
+
 
 def get_config(db_target: str) -> dict:
     host     = os.environ.get("SQLSERVER_HOST")     or keyring.get_password(SERVICE_NAME, "host")
@@ -30,39 +35,57 @@ def get_config(db_target: str) -> dict:
     return {"host": host, "user": user, "password": password, "database": database}
 
 
-def find_pnpm() -> Path:
+def find_executable_or_die(name: str) -> Path:
     """
-    Locate the pnpm executable.
+    Locate an executable by name. Search order:
+      1. PATH (via shutil.which), trying common Windows suffixes.
+      2. On Windows, fnm's node-versions directory (some shells — e.g. VS
+         Code's extension host — do not initialise fnm shims, so the executable
+         is on disk but not on PATH).
 
-    On most systems pnpm is on PATH.  Under VS Code's extension host the shell
-    environment is not initialised (no fnm shims), so we fall back to scanning
-    the stable fnm node-versions directory for the newest installed version.
+    Exits with a clear, actionable error message if not found.
     """
-    pnpm_name = "pnpm.cmd" if sys.platform == "win32" else "pnpm"
+    if sys.platform == "win32":
+        candidates = [f"{name}.cmd", f"{name}.exe", name]
+    else:
+        candidates = [name]
 
-    found = shutil.which(pnpm_name)
-    if found:
-        return Path(found)
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return Path(found)
 
     if sys.platform == "win32":
         fnm_versions = Path(os.environ.get("APPDATA", "")) / "fnm" / "node-versions"
         if fnm_versions.exists():
             for version_dir in sorted(fnm_versions.iterdir(), reverse=True):
-                candidate = version_dir / "installation" / pnpm_name
-                if candidate.exists():
-                    return candidate
+                for candidate in candidates:
+                    p = version_dir / "installation" / candidate
+                    if p.exists():
+                        return p
 
-    return Path(pnpm_name)  # fallback — OS will raise a clear FileNotFoundError
+    install_url = INSTALL_URLS.get(name, "")
+    print(
+        f"Error: '{name}' is not installed or not on PATH.\n"
+        f"\n"
+        f"The SQL Server MCP server requires '{name}' to bootstrap and run.\n"
+        f"Install it from: {install_url}\n"
+        f"\n"
+        f"After installing, open a new terminal session so the PATH is\n"
+        f"refreshed, then restart your MCP client.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
-def build_env(config: dict, pnpm: Path) -> dict:
+def build_env(config: dict, extra_paths: list[Path]) -> dict:
     """
-    Build the subprocess environment.
-
-    Prepends the pnpm installation directory to PATH so that node.exe (placed
-    next to pnpm.cmd by fnm) is always resolvable, even when VS Code's
-    extension host has not initialised the shell environment.
+    Build the subprocess environment. Prepends the directories of the located
+    executables to PATH so any child process the MCP server may spawn can find
+    them even when the parent shell environment was not initialised (e.g. under
+    VS Code's extension host).
     """
+    path_prefix = os.pathsep.join(str(p) for p in extra_paths)
     return {
         "SQLSERVER_HOST":       config["host"],
         "SQLSERVER_USER":       config["user"],
@@ -70,37 +93,31 @@ def build_env(config: dict, pnpm: Path) -> dict:
         "SQLSERVER_DATABASE":   config["database"],
         "SQLSERVER_ENCRYPT":    "false",
         "SQLSERVER_TRUST_CERT": "true",
-        "PATH":                 str(pnpm.parent) + os.pathsep + os.environ.get("PATH", ""),
+        "PATH":                 path_prefix + os.pathsep + os.environ.get("PATH", ""),
         "SYSTEMROOT":           os.environ.get("SYSTEMROOT", ""),
         "TEMP":                 os.environ.get("TEMP", ""),
         "TMP":                  os.environ.get("TMP", ""),
     }
 
 
-def ensure_dependencies(pnpm: Path, env: dict) -> None:
-    """Ensure node_modules and dist/ are built."""
-    dist_file = SCRIPT_DIR / "dist" / "index.js"
-
-    if dist_file.exists():
-        return
-
-    print("Building MCP server (this may take a minute on first run)...", file=sys.stderr)
-
+def build_dist(pnpm: Path, env: dict) -> None:
+    """Install dependencies and compile TypeScript on first run."""
     if not (SCRIPT_DIR / "pnpm-lock.yaml").exists():
         print(
-            "pnpm-lock.yaml not found.\n"
-            "Run 'pnpm install' in .mcp-servers/mcp-sqlserver/ and commit the lockfile.",
+            "pnpm-lock.yaml not found in the submodule. The fork is in an\n"
+            "inconsistent state — re-clone or run 'pnpm install' here and\n"
+            "commit the lockfile.",
             file=sys.stderr,
         )
         sys.exit(1)
 
+    print("Building MCP server (first run, ~15 seconds)...", file=sys.stderr)
     subprocess.run(
         [str(pnpm), "install", "--frozen-lockfile"],
         cwd=SCRIPT_DIR,
         env=env,
         check=True,
     )
-
     subprocess.run(
         [str(pnpm), "run", "build"],
         cwd=SCRIPT_DIR,
@@ -115,12 +132,22 @@ def main() -> None:
         sys.exit(1)
 
     config = get_config(sys.argv[1])
-    pnpm   = find_pnpm()
-    env    = build_env(config, pnpm)
 
-    ensure_dependencies(pnpm, env)
+    dist_file = SCRIPT_DIR / "dist" / "index.js"
 
-    result = subprocess.run(["node", str(SCRIPT_DIR / "dist" / "index.js")], env=env)
+    node = find_executable_or_die("node")
+    extra_paths = [node.parent]
+
+    if not dist_file.exists():
+        pnpm = find_executable_or_die("pnpm")
+        if pnpm.parent != node.parent:
+            extra_paths.insert(0, pnpm.parent)
+        env = build_env(config, extra_paths)
+        build_dist(pnpm, env)
+    else:
+        env = build_env(config, extra_paths)
+
+    result = subprocess.run([str(node), str(dist_file)], env=env)
     sys.exit(result.returncode)
 
 
