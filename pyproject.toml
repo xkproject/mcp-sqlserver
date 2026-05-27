@@ -1,0 +1,8 @@
+[project]
+name = "mcp-sqlserver-wrapper"
+version = "0.1.0"
+description = "Python wrapper for PCCOM SQL Server MCP integration"
+requires-python = ">=3.9"
+dependencies = [
+    "keyring>=25.0.0",
+]

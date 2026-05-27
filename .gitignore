@@ -151,7 +151,10 @@ scratch/
 *.ldf
 *.ndf
 
+# Python wrapper environment
+.venv/
+uv.lock
+
 # Authentication tokens (never commit these!)
-.npmrc
 auth.json
 tokens.json
