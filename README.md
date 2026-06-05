@@ -45,6 +45,15 @@ To update credentials later, run `set_credentials.py` again — current values a
 
 **Alternative: environment variables** — if `SQLSERVER_HOST`, `SQLSERVER_USER`, `SQLSERVER_PASSWORD` and `SQLSERVER_DATABASE` are set in the environment, they take precedence over the keychain.
 
+**Optional: file-based keyring backend (for SSH).** When the system keychain is not usable — notably from a Windows **SSH session**, whose network logon cannot reach Credential Manager (DPAPI) — you can switch keyring to a local file backend without changing any code. This is a viable way to run the server over SSH. Run once per machine:
+
+```powershell
+uv run .keyrings-alt/setup_keyrings-alt.py   # point keyring at the file backend
+uv run set_credentials.py                    # re-enter credentials — the new store starts empty
+```
+
+`keyringrc.cfg` is written to your user profile (not the repo), so this is opt-in per machine and does not affect other developers. `.keyrings-alt/find-keyrings-alt.py` prints where keyring reads its config from. Note the file backend stores values unencrypted, so use it only where that is acceptable.
+
 ### 2. Configure your MCP client
 
 Add the server entry to your MCP client config:

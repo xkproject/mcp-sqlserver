@@ -5,4 +5,5 @@ description = "Python wrapper for PCCOM SQL Server MCP integration"
 requires-python = ">=3.9"
 dependencies = [
     "keyring>=25.0.0",
+    "keyrings-alt>=5.0.2",
 ]
