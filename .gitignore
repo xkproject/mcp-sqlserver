@@ -158,3 +158,4 @@ uv.lock
 # Authentication tokens (never commit these!)
 auth.json
 tokens.json
+/package-lock.json
