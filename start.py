@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import contextlib
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import keyring
@@ -14,6 +17,15 @@ INSTALL_URLS = {
     "node": "https://nodejs.org/  (or via fnm: https://github.com/Schniz/fnm)",
     "pnpm": "https://pnpm.io/installation",
 }
+
+# Bootstrap = the 'pnpm install' + 'tsc' that materialises dist/.
+BOOTSTRAP_LOCK     = SCRIPT_DIR / ".bootstrap.lock"
+BOOTSTRAP_STAMP    = SCRIPT_DIR / "dist" / ".bootstrap-ok"
+LOCK_WAIT_SECONDS  = 300
+LOCK_STALE_SECONDS = 900
+
+# Everything the compiled dist/ is derived from, beyond src/**/*.ts.
+BOOTSTRAP_INPUTS = ("package.json", "pnpm-lock.yaml", "tsconfig.json")
 
 
 def get_config(db_target: str) -> dict:
@@ -100,8 +112,134 @@ def build_env(config: dict, extra_paths: list[Path]) -> dict:
     }
 
 
+def sources_fingerprint() -> str:
+    """
+    Digest of everything dist/ is compiled from: src/**/*.ts plus the manifests
+    that drive install and compilation. Paths go into the digest alongside the
+    bytes, so adding, renaming or deleting a source file counts as a change.
+    """
+    digest = hashlib.sha256()
+    files  = sorted((SCRIPT_DIR / "src").rglob("*.ts"))
+    files += [SCRIPT_DIR / name for name in BOOTSTRAP_INPUTS]
+
+    for path in files:
+        relative = path.relative_to(SCRIPT_DIR).as_posix()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            # A missing input is itself part of the identity of this checkout.
+            digest.update(b"missing\0" + relative.encode("utf-8") + b"\0")
+            continue
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(data)
+
+    return digest.hexdigest()
+
+
+def needs_bootstrap(dist_file: Path) -> bool:
+    """
+    dist/ is trustworthy only when the stamp beside it records the fingerprint
+    of the sources currently on disk. Two failure modes this closes:
+
+      - Stale build. Checking that index.js merely exists meant a checkout to
+        another commit kept running the previously compiled code forever, since
+        nothing ever asked whether dist/ still matched src/.
+      - Half-written build. The MCP client drops the connection after ~30s; a
+        slow build killed midway left a partial dist/ that later runs executed
+        as if it were good. The stamp is written only after 'tsc' succeeds.
+    """
+    if not dist_file.exists():
+        return True
+    try:
+        return BOOTSTRAP_STAMP.read_text(encoding="ascii").strip() != sources_fingerprint()
+    except OSError:
+        return True
+
+
+def node_modules_in_sync() -> bool:
+    """
+    True when pnpm's installed-state marker is at least as new as the lockfile,
+    i.e. 'pnpm install' has nothing left to do. Skipping a redundant install is
+    what keeps a plain recompile short enough to finish inside the MCP client's
+    connection timeout: the install dominates the bootstrap cost.
+    """
+    marker   = SCRIPT_DIR / "node_modules" / ".modules.yaml"
+    lockfile = SCRIPT_DIR / "pnpm-lock.yaml"
+    try:
+        return marker.stat().st_mtime >= lockfile.stat().st_mtime
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def bootstrap_lock():
+    """
+    Cross-process mutex around the bootstrap build.
+
+    The MCP client starts one process per configured server (sqlserver-pccom
+    and sqlserver-dat) against this same directory, simultaneously. Without a
+    mutex both ran 'pnpm install' and 'tsc' over the same node_modules and
+    dist/, clobbering each other; the loser died with a bare 'Connection
+    closed'. Now only the winner builds and the others wait here, finding
+    dist/ already in place when they wake up.
+
+    Implemented with an O_EXCL lock file rather than a third-party file-lock
+    package, so the wrapper keeps running from a bare 'uv run' with keyring as
+    its only dependency.
+    """
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fd = os.open(str(BOOTSTRAP_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            break
+        except FileExistsError:
+            pass
+
+        try:
+            age = time.time() - BOOTSTRAP_LOCK.stat().st_mtime
+        except OSError:
+            continue  # holder released it between the two calls; retry at once
+
+        if age > LOCK_STALE_SECONDS:
+            print(f"Removing stale bootstrap lock ({int(age)}s old).", file=sys.stderr)
+            BOOTSTRAP_LOCK.unlink(missing_ok=True)
+            continue
+
+        if time.monotonic() >= deadline:
+            print(
+                f"Timed out after {LOCK_WAIT_SECONDS}s waiting for another MCP server "
+                f"process to finish building this directory.",
+                f"",
+                f"Build it by hand, then restart your MCP client:",
+                f"  cd {SCRIPT_DIR}",
+                f"  pnpm install --frozen-lockfile && pnpm run build",
+                f"",
+                f"If no build is actually running, delete {BOOTSTRAP_LOCK.name} first.",
+                sep="\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        time.sleep(0.5)
+
+    try:
+        yield
+    finally:
+        BOOTSTRAP_LOCK.unlink(missing_ok=True)
+
+
 def build_dist(pnpm: Path, env: dict) -> None:
-    """Install dependencies and compile TypeScript on first run."""
+    """
+    Install dependencies and compile TypeScript. Call only under
+    bootstrap_lock(); writes BOOTSTRAP_STAMP once both steps have succeeded.
+    """
+    # Captured before compiling on purpose. If a source file changes while tsc
+    # runs, the stamp records the older fingerprint and the next start rebuilds
+    # -- the safe direction. Stamping afterwards would bless code never built.
+    fingerprint = sources_fingerprint()
+
     if not (SCRIPT_DIR / "pnpm-lock.yaml").exists():
         print(
             "pnpm-lock.yaml not found in the submodule. The fork is in an\n"
@@ -111,19 +249,35 @@ def build_dist(pnpm: Path, env: dict) -> None:
         )
         sys.exit(1)
 
-    print("Building MCP server (first run, ~15 seconds)...", file=sys.stderr)
-    subprocess.run(
-        [str(pnpm), "install", "--frozen-lockfile"],
-        cwd=SCRIPT_DIR,
-        env=env,
-        check=True,
+    print(
+        "Sources changed, rebuilding MCP server. This can outlast your MCP",
+        "client's connection timeout: if the server shows up as timed out,",
+        "just reconnect it - the build is kept and the retry is instant.",
+        sep="\n",
+        file=sys.stderr,
     )
+
+    # tsc does not prune, so a rebuild after files were renamed or deleted
+    # would otherwise leave orphaned .js behind next to the fresh output.
+    shutil.rmtree(SCRIPT_DIR / "dist", ignore_errors=True)
+
+    if node_modules_in_sync():
+        print("Dependencies already in sync, skipping 'pnpm install'.", file=sys.stderr)
+    else:
+        subprocess.run(
+            [str(pnpm), "install", "--frozen-lockfile"],
+            cwd=SCRIPT_DIR,
+            env=env,
+            check=True,
+        )
+
     subprocess.run(
         [str(pnpm), "run", "build"],
         cwd=SCRIPT_DIR,
         env=env,
         check=True,
     )
+    BOOTSTRAP_STAMP.write_text(fingerprint + "\n", encoding="ascii")
 
 
 def main() -> None:
@@ -138,12 +292,15 @@ def main() -> None:
     node = find_executable_or_die("node")
     extra_paths = [node.parent]
 
-    if not dist_file.exists():
+    if needs_bootstrap(dist_file):
         pnpm = find_executable_or_die("pnpm")
         if pnpm.parent != node.parent:
             extra_paths.insert(0, pnpm.parent)
         env = build_env(config, extra_paths)
-        build_dist(pnpm, env)
+        with bootstrap_lock():
+            # A peer process may have finished the build while we waited.
+            if needs_bootstrap(dist_file):
+                build_dist(pnpm, env)
     else:
         env = build_env(config, extra_paths)
 

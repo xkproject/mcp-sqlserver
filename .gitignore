@@ -158,3 +158,6 @@ scratch/
 auth.json
 tokens.json
 /package-lock.json
+
+# Bootstrap mutex held by start.py while building dist/
+.bootstrap.lock
