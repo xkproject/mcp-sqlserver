@@ -78,6 +78,8 @@ async function runServer() {
               name: tool.getName(),
               description: tool.getDescription(),
               inputSchema: tool.getInputSchema(),
+              // Every tool here is read-only: QueryValidator rejects all DML/DDL.
+              annotations: { readOnlyHint: true },
             })),
           };
         });
